@@ -26,6 +26,9 @@ pub use aggregation_tree::BlsSignatureCollection;
 mod bls;
 pub use bls::{BlsAggregateSignature, BlsError, BlsKeyPair, BlsPubKey, BlsSignature};
 
+pub mod remote;
+pub use remote::{BlsSigningCallback, RemoteBlsError, RemoteBlsKeyPair, RemoteBlsSignature};
+
 impl std::fmt::Display for BlsPubKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let bytes = self.bytes();

@@ -19,6 +19,7 @@ monad-secp = { workspace = true }
 monad-version = { workspace = true }
 
 aes = { workspace = true }
+bincode = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 ctr = { workspace = true }
 hex = { workspace = true }

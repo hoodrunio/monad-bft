@@ -5541,6 +5541,7 @@ name = "monad-keystore"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "bincode",
  "clap 4.5.47",
  "ctr",
  "hex",
@@ -5869,6 +5870,29 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zerocopy",
+]
+
+[[package]]
+name = "monad-remote-signer"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "clap 4.5.47",
+ "hex",
+ "monad-bls",
+ "monad-crypto",
+ "monad-keystore",
+ "monad-secp",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

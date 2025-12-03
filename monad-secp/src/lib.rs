@@ -14,9 +14,11 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 mod recoverable_address;
+pub mod remote;
 mod secp;
 
 use alloy_primitives::Address;
+pub use remote::{RemoteSecpError, RemoteSecpKeyPair, RemoteSecpSignature, SecpSigningCallback};
 use alloy_rlp::{Decodable, Encodable};
 use monad_crypto::{
     certificate_signature::{

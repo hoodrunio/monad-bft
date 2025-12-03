@@ -1,0 +1,35 @@
+[package]
+name = "monad-remote-signer"
+version = "0.1.0"
+edition = "2021"
+description = "Remote validator signer daemon for Monad BFT"
+
+[lib]
+bench = false
+
+[[bin]]
+name = "monad-signer-daemon"
+path = "src/bin/daemon.rs"
+bench = false
+
+[dependencies]
+monad-bls = { workspace = true }
+monad-crypto = { workspace = true }
+monad-keystore = { workspace = true }
+monad-secp = { workspace = true }
+
+bincode = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full", "net"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

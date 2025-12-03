@@ -92,8 +92,8 @@ RUN ASMFLAGS="-march=haswell" CFLAGS="-march=haswell" CXXFLAGS="-march=haswell" 
     mv target/release/monad-indexer indexer && \
     cp `ls -Lt $(find target/release | grep -e "libtriedb_driver.so")` . && \
     ldd $(ls -Lt $(find target/release | grep -e "libtriedb_driver.so")) | docker/filter-dependent-shared-objects.py | xargs -I {} cp {} . && \
-    find target/release/build -name "libblake3.so*" -exec cp {} . \; && \
-    find target/release/build -name "libquill.so*" -exec cp {} . \;
+    find target/release -name "libblake3.so*" -exec cp {} . \; 2>/dev/null || true && \
+    find target/release -name "libquill*.so*" -exec cp {} . \; 2>/dev/null || true
 
 # Runner
 FROM base AS runner
@@ -107,3 +107,8 @@ COPY --from=builder /usr/src/monad-bft/archiver /usr/local/bin/monad-archiver
 COPY --from=builder /usr/src/monad-bft/archive-checker /usr/local/bin/monad-archive-checker
 COPY --from=builder /usr/src/monad-bft/indexer /usr/local/bin/monad-indexer
 COPY --from=builder /usr/src/monad-bft/*.so /usr/local/lib
+
+# Create versioned symlinks for shared libraries
+RUN ln -sf /usr/local/lib/libblake3.so /usr/local/lib/libblake3.so.0 && \
+    ln -sf /usr/local/lib/libquill.so /usr/local/lib/libquill.so.3.9.0 && \
+    ldconfig

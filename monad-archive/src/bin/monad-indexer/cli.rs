@@ -74,6 +74,17 @@ pub struct Cli {
     /// Enable eth_getLogs indexing (disabled by default)
     #[arg(long, default_value_t = false)]
     pub enable_logs_indexing: bool,
+
+    /// If set, indexer will require traces to be present for all blocks.
+    /// Default: false (missing traces are logged and indexed with empty trace)
+    #[arg(long, default_value_t = false)]
+    pub require_traces: bool,
+
+    /// Skip bad blocks.
+    /// If set, indexer will skip blocks that fail to index and log an error.
+    /// DO NOT ENABLE UNDER NORMAL OPERATION
+    #[arg(long, default_value_t = false)]
+    pub unsafe_skip_bad_blocks: bool,
 }
 
 #[derive(Debug, Subcommand)]

@@ -30,6 +30,10 @@ use monad_archive::{model::logs_index::LogsIndexArchiver, prelude::*};
 /// * `async_backfill` - If set, indexer will perform an asynchronous backfill of the index
 ///    This allows a second indexer to backfill a range while the first indexer is running
 /// * `poll_frequency` - How often to check for new blocks
+/// * `require_traces` - If true, blocks without traces will cause an error.
+///    If false (default), missing traces are logged and indexed with empty trace.
+/// * `unsafe_skip_bad_blocks` - If true, blocks that fail to index are skipped.
+///    DO NOT ENABLE UNDER NORMAL OPERATION.
 pub async fn index_worker(
     block_data_reader: impl BlockDataReader + Sync + Send,
     fallback_block_data_source: Option<impl BlockDataReader + Sync + Send>,
@@ -41,6 +45,8 @@ pub async fn index_worker(
     stop_block_override: Option<u64>,
     poll_frequency: Duration,
     async_backfill: bool,
+    require_traces: bool,
+    unsafe_skip_bad_blocks: bool,
 ) {
     // initialize starting block from stored latest marker
     let latest = indexer
@@ -91,6 +97,8 @@ pub async fn index_worker(
             max_concurrent_blocks,
             &metrics,
             async_backfill,
+            require_traces,
+            unsafe_skip_bad_blocks,
         )
         .await;
 
@@ -111,6 +119,8 @@ async fn index_blocks(
     concurrency: usize,
     metrics: &Metrics,
     async_backfill: bool,
+    require_traces: bool,
+    unsafe_skip_bad_blocks: bool,
 ) -> u64 {
     let start = Instant::now();
 
@@ -122,13 +132,22 @@ async fn index_blocks(
                 indexer,
                 log_index,
                 block_num,
+                metrics,
+                require_traces,
+                unsafe_skip_bad_blocks,
             )
             .await
             {
                 Ok(num_txs) => Ok(num_txs),
                 Err(e) => {
-                    error!("Failed to handle block: {e:?}");
-                    Err(block_num)
+                    if unsafe_skip_bad_blocks {
+                        error!(block_num, "Skipping bad block: {e:?}");
+                        metrics.inc_counter(MetricNames::INDEX_WORKER_BLOCKS_SKIPPED);
+                        Ok(0)
+                    } else {
+                        error!("Failed to handle block: {e:?}");
+                        Err(block_num)
+                    }
                 }
             }
         })
@@ -159,12 +178,20 @@ async fn index_blocks(
     new_latest_indexed
 }
 
+/// Check if an error is due to missing traces
+fn is_missing_trace_error(e: &eyre::Report) -> bool {
+    e.to_string().contains("No trace found")
+}
+
 async fn handle_block(
     block_data_reader: &(impl BlockDataReader + Send),
     fallback_block_data_source: &Option<(impl BlockDataReader + Send)>,
     tx_index_archiver: &TxIndexArchiver,
     log_index: Option<&LogsIndexArchiver>,
     block_num: u64,
+    metrics: &Metrics,
+    require_traces: bool,
+    _unsafe_skip_bad_blocks: bool,
 ) -> Result<usize> {
     let BlockDataWithOffsets {
         block,
@@ -176,6 +203,34 @@ async fn handle_block(
         .await
     {
         Ok(data) => data,
+        Err(e) if is_missing_trace_error(&e) && !require_traces => {
+            // Trace is missing but not required - fetch block and receipts separately
+            // and use empty traces
+            warn!(
+                block_num,
+                "Missing traces for block, indexing with empty traces"
+            );
+            metrics.inc_counter(MetricNames::INDEX_WORKER_BLOCKS_MISSING_TRACES);
+
+            let block = block_data_reader
+                .get_block_by_number(block_num)
+                .await
+                .wrap_err_with(|| format!("Failed to get block {block_num}"))?;
+            let receipts = block_data_reader
+                .get_block_receipts(block_num)
+                .await
+                .wrap_err_with(|| format!("Failed to get receipts for block {block_num}"))?;
+
+            // Create empty traces for each transaction
+            let traces: BlockTraces = vec![vec![]; block.body.transactions.len()];
+
+            BlockDataWithOffsets {
+                block,
+                receipts,
+                traces,
+                offsets: None, // No offsets available when traces are missing
+            }
+        }
         Err(e) => match fallback_block_data_source {
             Some(fallback) => {
                 warn!(?e, block_num, "Failed to get block data with offsets from main source for block {block_num}, trying fallback source");
@@ -375,7 +430,9 @@ mod tests {
             Metrics::none(),
             Some(5),
             Duration::from_micros(1),
-            false,
+            false, // async_backfill
+            true,  // require_traces
+            false, // unsafe_skip_bad_blocks
         ));
 
         // Small delay to let worker process initial blocks
@@ -458,7 +515,9 @@ mod tests {
             Metrics::none(),
             Some(10), // Stop at block 10
             Duration::from_micros(1),
-            false,
+            false, // async_backfill
+            true,  // require_traces
+            false, // unsafe_skip_bad_blocks
         ));
 
         // Small delay to let worker start processing initial blocks
@@ -541,7 +600,9 @@ mod tests {
             Metrics::none(),
             Some(5), // stop_block_override - make it finite for testing
             Duration::from_micros(1),
-            false,
+            false, // async_backfill
+            true,  // require_traces
+            false, // unsafe_skip_bad_blocks
         ));
 
         // Wait for worker to complete
@@ -596,7 +657,9 @@ mod tests {
             block_range,
             2, // concurrency
             &Metrics::none(),
-            false,
+            false, // async_backfill
+            true,  // require_traces
+            false, // unsafe_skip_bad_blocks
         )
         .await;
 
@@ -650,7 +713,9 @@ mod tests {
             block_range,
             2, // concurrency
             &Metrics::none(),
-            false,
+            false, // async_backfill
+            true,  // require_traces
+            false, // unsafe_skip_bad_blocks
         )
         .await;
         // Should return the last successful block before error
@@ -696,7 +761,7 @@ mod tests {
             .unwrap();
 
         // Test handle_block
-        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num)
+        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false)
             .await
             .unwrap();
         assert_eq!(num_txs, 1);
@@ -737,7 +802,7 @@ mod tests {
             .unwrap();
 
         // Test handle_block
-        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num)
+        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false)
             .await
             .unwrap();
         assert_eq!(num_txs, 1);
@@ -771,7 +836,7 @@ mod tests {
         reader.archive_traces(traces, block_num).await.unwrap();
 
         // Test handle_block
-        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num)
+        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false)
             .await
             .unwrap();
 
@@ -801,7 +866,7 @@ mod tests {
             .unwrap();
 
         // Test handle_block
-        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num)
+        let num_txs = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false)
             .await
             .unwrap();
 
@@ -831,7 +896,7 @@ mod tests {
         reader.archive_traces(traces, block_num).await.unwrap();
 
         // Should fail since block is missing
-        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num).await;
+        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false).await;
         assert!(result.is_err());
     }
 
@@ -871,6 +936,9 @@ mod tests {
             &index_archiver,
             None,
             block_num,
+            &Metrics::none(),
+            true,
+            false,
         )
         .await;
         assert!(result.is_ok());
@@ -888,7 +956,7 @@ mod tests {
         reader.archive_block(block).await.unwrap();
         reader.archive_traces(traces, block_num).await.unwrap();
 
-        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num).await;
+        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false).await;
         assert!(result.is_err());
     }
 
@@ -904,7 +972,7 @@ mod tests {
         reader.archive_block(block).await.unwrap();
         reader.archive_receipts(receipts, block_num).await.unwrap();
 
-        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num).await;
+        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false).await;
         assert!(result.is_err());
     }
 
@@ -923,7 +991,7 @@ mod tests {
         reader.archive_receipts(receipts, block_num).await.unwrap();
         reader.archive_traces(traces, block_num).await.unwrap();
 
-        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num).await;
+        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false).await;
         assert!(result.is_err());
     }
 
@@ -942,7 +1010,7 @@ mod tests {
         reader.archive_receipts(receipts, block_num).await.unwrap();
         reader.archive_traces(traces, block_num).await.unwrap();
 
-        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num).await;
+        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false).await;
         assert!(result.is_err());
     }
 
@@ -961,7 +1029,7 @@ mod tests {
         reader.archive_receipts(receipts, block_num).await.unwrap();
         reader.archive_traces(traces, block_num).await.unwrap();
 
-        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num).await;
+        let result = handle_block(&reader, &NO_FALLBACK, &index_archiver, None, block_num, &Metrics::none(), true, false).await;
         assert!(result.is_err());
     }
 }

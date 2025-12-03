@@ -112,6 +112,8 @@ async fn run_indexer(args: cli::Cli) -> Result<()> {
         args.stop_block,
         Duration::from_millis(500),
         args.async_backfill,
+        args.require_traces,
+        args.unsafe_skip_bad_blocks,
     ))
     .await
     .map_err(Into::into)

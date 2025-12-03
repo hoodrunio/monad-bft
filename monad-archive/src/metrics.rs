@@ -54,6 +54,8 @@ pub enum MetricNames {
     BLOCK_ARCHIVE_WORKER_RECEIPTS_FALLBACK,
     BLOCK_ARCHIVE_WORKER_TRACES_FALLBACK,
     BLOCK_ARCHIVE_WORKER_TRACES_FAILED,
+    INDEX_WORKER_BLOCKS_MISSING_TRACES,
+    INDEX_WORKER_BLOCKS_SKIPPED,
 
     SOURCE_LATEST_BLOCK_NUM,
     END_BLOCK_NUMBER,
@@ -138,6 +140,8 @@ impl MetricNames {
             MetricNames::BFT_BLOCK_FILES_UPLOADED => "bft_block_files_uploaded",
             MetricNames::BFT_BLOCK_FILES_FAILED_TO_PROCESS => "bft_block_files_failed_to_process",
             MetricNames::BLOCK_ARCHIVE_WORKER_TRACES_FAILED => "block_archive_worker_traces_failed",
+            MetricNames::INDEX_WORKER_BLOCKS_MISSING_TRACES => "index_worker_blocks_missing_traces",
+            MetricNames::INDEX_WORKER_BLOCKS_SKIPPED => "index_worker_blocks_skipped",
             MetricNames::GENERIC_ARCHIVE_FILES_DISCOVERED => "generic_archive_files_discovered",
             MetricNames::GENERIC_ARCHIVE_FILES_ALREADY_IN_S3 => {
                 "generic_archive_files_already_in_s3"

@@ -4,6 +4,10 @@
 //! round/epoch, which would result in slashing.
 
 use crate::protocol::{KeyType, SignRequest};
+use alloy_rlp::Decodable;
+use monad_consensus_types::timeout::TimeoutInfo;
+use monad_consensus_types::voting::Vote;
+use monad_crypto::signing_domain::{self, SigningDomain};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -92,10 +96,16 @@ impl DoubleSignGuard {
         let domain_key = hex::encode(&req.domain);
         let msg_hash = self.hash_message(&req.message);
 
-        // Extract round/epoch from message if possible
-        // For now, we use a simplified approach: just track by domain + message hash
-        // In production, we'd parse the actual message to extract round/epoch
-        let (epoch, round) = self.extract_epoch_round(&req.message);
+        // Extract round/epoch from message based on signing domain
+        let Some((epoch, round)) = self.extract_epoch_round(&req.domain, &req.message) else {
+            // Cannot extract epoch/round - skip double-sign protection for this domain
+            // This is intentional: we only protect Vote and Timeout messages
+            debug!(
+                "Skipping double-sign protection for domain={} (unknown message type)",
+                domain_key
+            );
+            return Ok(());
+        };
 
         debug!(
             "Checking sign request: domain={}, epoch={}, round={}, hash={}",
@@ -181,31 +191,39 @@ impl DoubleSignGuard {
         hasher.finalize().into()
     }
 
-    /// Extract epoch and round from message.
+    /// Extract epoch and round from message based on signing domain.
     ///
-    /// This is a simplified implementation. In production, we would
-    /// parse the RLP-encoded message to extract actual consensus values.
-    fn extract_epoch_round(&self, message: &[u8]) -> (u64, u64) {
-        // For PoC: Use message hash as a simple identifier
-        // The actual implementation would parse the message structure
-        //
-        // Vote message structure (from monad-consensus):
-        // Vote { round: Round, epoch: Epoch, ... }
-        //
-        // For now, we'll use bytes 0-8 as epoch and 8-16 as round
-        // This is a placeholder - real implementation needs proper parsing
-        if message.len() >= 16 {
-            let epoch = u64::from_le_bytes(message[0..8].try_into().unwrap_or([0; 8]));
-            let round = u64::from_le_bytes(message[8..16].try_into().unwrap_or([0; 8]));
-            (epoch, round)
+    /// Parses the RLP-encoded message to extract epoch and round values
+    /// based on the signing domain prefix.
+    fn extract_epoch_round(&self, domain: &[u8], message: &[u8]) -> Option<(u64, u64)> {
+        // Check domain prefix to determine message type
+        if domain == signing_domain::Vote::PREFIX {
+            // Decode Vote message
+            match Vote::decode(&mut &message[..]) {
+                Ok(vote) => Some((vote.epoch.0, vote.round.0)),
+                Err(e) => {
+                    warn!("Failed to decode Vote message: {:?}", e);
+                    None
+                }
+            }
+        } else if domain == signing_domain::Timeout::PREFIX {
+            // Decode TimeoutInfo message
+            match TimeoutInfo::decode(&mut &message[..]) {
+                Ok(timeout_info) => Some((timeout_info.epoch.0, timeout_info.round.0)),
+                Err(e) => {
+                    warn!("Failed to decode TimeoutInfo message: {:?}", e);
+                    None
+                }
+            }
         } else {
-            // Fallback: use first 8 bytes as a combined identifier
-            let id = if message.len() >= 8 {
-                u64::from_le_bytes(message[0..8].try_into().unwrap_or([0; 8]))
-            } else {
-                0
-            };
-            (0, id)
+            // Unknown domain - cannot extract epoch/round
+            // This is not an error, but we cannot provide double-sign protection
+            // for unknown message types
+            debug!(
+                "Unknown signing domain: {}, skipping epoch/round extraction",
+                hex::encode(domain)
+            );
+            None
         }
     }
 
@@ -259,6 +277,7 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use monad_types::{BlockId, Epoch, Hash, Round, GENESIS_ROUND};
     use tempfile::TempDir;
 
     fn create_test_guard() -> (DoubleSignGuard, TempDir) {
@@ -268,14 +287,37 @@ mod tests {
         (guard, temp_dir)
     }
 
+    /// Create a test Vote and RLP-encode it
+    fn encode_vote(epoch: u64, round: u64, block_id_byte: u8) -> Vec<u8> {
+        let mut hash = [0u8; 32];
+        hash[0] = block_id_byte;
+        let vote = Vote {
+            id: BlockId(Hash(hash)),
+            round: Round(round),
+            epoch: Epoch(epoch),
+        };
+        alloy_rlp::encode(&vote)
+    }
+
+    /// Create a test TimeoutInfo and RLP-encode it
+    fn encode_timeout_info(epoch: u64, round: u64, high_qc_round: u64) -> Vec<u8> {
+        let timeout_info = TimeoutInfo {
+            epoch: Epoch(epoch),
+            round: Round(round),
+            high_qc_round: Round(high_qc_round),
+            high_tip_round: GENESIS_ROUND,
+        };
+        alloy_rlp::encode(&timeout_info)
+    }
+
     #[test]
-    fn test_allow_first_sign() {
+    fn test_allow_first_vote_sign() {
         let (mut guard, _temp) = create_test_guard();
 
         let req = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1], // epoch=1, round=1
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 1, 0),
             request_id: 1,
         };
 
@@ -283,13 +325,27 @@ mod tests {
     }
 
     #[test]
-    fn test_allow_same_message_twice() {
+    fn test_allow_first_timeout_sign() {
         let (mut guard, _temp) = create_test_guard();
 
         let req = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
+            domain: signing_domain::Timeout::PREFIX.to_vec(),
+            message: encode_timeout_info(1, 1, 0),
+            request_id: 1,
+        };
+
+        assert!(guard.check_and_record(&req).is_ok());
+    }
+
+    #[test]
+    fn test_allow_same_vote_twice() {
+        let (mut guard, _temp) = create_test_guard();
+
+        let req = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 1, 0),
             request_id: 1,
         };
 
@@ -299,20 +355,46 @@ mod tests {
     }
 
     #[test]
-    fn test_block_conflicting_signature() {
+    fn test_block_conflicting_vote() {
         let (mut guard, _temp) = create_test_guard();
 
+        // First vote for epoch=1, round=1, block_id with byte 0
         let req1 = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1], // epoch=1, round=1
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 1, 0),
             request_id: 1,
         };
 
+        // Second vote for same epoch/round but different block_id
         let req2 = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 99], // Same epoch/round, different content
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 1, 99), // Different block_id!
+            request_id: 2,
+        };
+
+        assert!(guard.check_and_record(&req1).is_ok());
+        assert!(guard.check_and_record(&req2).is_err());
+    }
+
+    #[test]
+    fn test_block_conflicting_timeout() {
+        let (mut guard, _temp) = create_test_guard();
+
+        // First timeout for epoch=1, round=1
+        let req1 = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Timeout::PREFIX.to_vec(),
+            message: encode_timeout_info(1, 1, 0),
+            request_id: 1,
+        };
+
+        // Second timeout for same epoch/round but different high_qc_round
+        let req2 = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Timeout::PREFIX.to_vec(),
+            message: encode_timeout_info(1, 1, 5), // Different high_qc_round!
             request_id: 2,
         };
 
@@ -326,15 +408,15 @@ mod tests {
 
         let req1 = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1], // epoch=1, round=1
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 1, 0),
             request_id: 1,
         };
 
         let req2 = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2], // epoch=1, round=2
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 2, 0), // Different round
             request_id: 2,
         };
 
@@ -348,15 +430,60 @@ mod tests {
 
         let req1 = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 5], // epoch=1, round=5
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 5, 0), // epoch=1, round=5
             request_id: 1,
         };
 
         let req2 = SignRequest {
             key_type: KeyType::Bls,
-            domain: b"test-domain".to_vec(),
-            message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3], // epoch=1, round=3 (past!)
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 3, 0), // epoch=1, round=3 (past!)
+            request_id: 2,
+        };
+
+        assert!(guard.check_and_record(&req1).is_ok());
+        assert!(guard.check_and_record(&req2).is_err());
+    }
+
+    #[test]
+    fn test_allow_different_epochs() {
+        let (mut guard, _temp) = create_test_guard();
+
+        let req1 = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 5, 0), // epoch=1, round=5
+            request_id: 1,
+        };
+
+        // New epoch resets round tracking
+        let req2 = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(2, 1, 0), // epoch=2, round=1
+            request_id: 2,
+        };
+
+        assert!(guard.check_and_record(&req1).is_ok());
+        assert!(guard.check_and_record(&req2).is_ok());
+    }
+
+    #[test]
+    fn test_block_past_epoch() {
+        let (mut guard, _temp) = create_test_guard();
+
+        let req1 = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(2, 1, 0), // epoch=2
+            request_id: 1,
+        };
+
+        let req2 = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 10, 0), // epoch=1 (past epoch!)
             request_id: 2,
         };
 
@@ -374,8 +501,8 @@ mod tests {
             let mut guard = DoubleSignGuard::new(state_file.clone()).unwrap();
             let req = SignRequest {
                 key_type: KeyType::Bls,
-                domain: b"test-domain".to_vec(),
-                message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1],
+                domain: signing_domain::Vote::PREFIX.to_vec(),
+                message: encode_vote(1, 1, 0),
                 request_id: 1,
             };
             guard.check_and_record(&req).unwrap();
@@ -386,12 +513,62 @@ mod tests {
             let mut guard = DoubleSignGuard::new(state_file).unwrap();
             let req = SignRequest {
                 key_type: KeyType::Bls,
-                domain: b"test-domain".to_vec(),
-                message: vec![0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 99], // Different!
+                domain: signing_domain::Vote::PREFIX.to_vec(),
+                message: encode_vote(1, 1, 99), // Different block_id!
                 request_id: 2,
             };
             // Should be blocked because we already signed for this round
             assert!(guard.check_and_record(&req).is_err());
         }
+    }
+
+    #[test]
+    fn test_unknown_domain_allowed() {
+        let (mut guard, _temp) = create_test_guard();
+
+        // Unknown domain - should be allowed (no double-sign protection)
+        let req = SignRequest {
+            key_type: KeyType::Bls,
+            domain: b"unknown-domain".to_vec(),
+            message: vec![1, 2, 3, 4],
+            request_id: 1,
+        };
+
+        assert!(guard.check_and_record(&req).is_ok());
+
+        // Same unknown domain with different message - also allowed
+        let req2 = SignRequest {
+            key_type: KeyType::Bls,
+            domain: b"unknown-domain".to_vec(),
+            message: vec![5, 6, 7, 8],
+            request_id: 2,
+        };
+
+        assert!(guard.check_and_record(&req2).is_ok());
+    }
+
+    #[test]
+    fn test_vote_and_timeout_separate_tracking() {
+        let (mut guard, _temp) = create_test_guard();
+
+        // Sign a vote for epoch=1, round=1
+        let vote_req = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Vote::PREFIX.to_vec(),
+            message: encode_vote(1, 1, 0),
+            request_id: 1,
+        };
+
+        // Sign a timeout for same epoch/round (different domain)
+        let timeout_req = SignRequest {
+            key_type: KeyType::Bls,
+            domain: signing_domain::Timeout::PREFIX.to_vec(),
+            message: encode_timeout_info(1, 1, 0),
+            request_id: 2,
+        };
+
+        // Both should succeed (different domains)
+        assert!(guard.check_and_record(&vote_req).is_ok());
+        assert!(guard.check_and_record(&timeout_req).is_ok());
     }
 }

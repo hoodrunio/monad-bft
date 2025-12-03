@@ -5876,13 +5876,16 @@ dependencies = [
 name = "monad-remote-signer"
 version = "0.1.0"
 dependencies = [
+ "alloy-rlp",
  "bincode",
  "clap 4.5.47",
  "hex",
  "monad-bls",
+ "monad-consensus-types",
  "monad-crypto",
  "monad-keystore",
  "monad-secp",
+ "monad-types",
  "rand 0.8.5",
  "serde",
  "serde_json",

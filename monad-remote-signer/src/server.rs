@@ -7,8 +7,7 @@ use crate::security::{DoubleSignError, DoubleSignGuard};
 use monad_bls::{BlsKeyPair, BlsSignature};
 use monad_crypto::certificate_signature::CertificateSignature;
 use monad_crypto::signing_domain::{
-    ConsensusMessage, NameRecord, NoEndorsement, RaptorcastAppMessage, RaptorcastChunk,
-    RoundSignature, SigningDomain, Timeout, Tip, Vote,
+    ConsensusMessage, NoEndorsement, RoundSignature, SigningDomain, Timeout, Tip, Vote,
 };
 use monad_secp::{KeyPair as SecpKeyPair, SecpSignature};
 use std::io::{Read, Write};
@@ -213,9 +212,6 @@ impl SignerServer {
             d if d == RoundSignature::PREFIX => {
                 BlsSignature::sign::<RoundSignature>(message, &self.bls_keypair)
             }
-            d if d == RaptorcastChunk::PREFIX => {
-                BlsSignature::sign::<RaptorcastChunk>(message, &self.bls_keypair)
-            }
             _ => {
                 return Err(ServerError::Protocol(format!(
                     "Unknown BLS signing domain: {}",
@@ -234,12 +230,6 @@ impl SignerServer {
                 SecpSignature::sign::<ConsensusMessage>(message, &self.secp_keypair)
             }
             d if d == Tip::PREFIX => SecpSignature::sign::<Tip>(message, &self.secp_keypair),
-            d if d == NameRecord::PREFIX => {
-                SecpSignature::sign::<NameRecord>(message, &self.secp_keypair)
-            }
-            d if d == RaptorcastAppMessage::PREFIX => {
-                SecpSignature::sign::<RaptorcastAppMessage>(message, &self.secp_keypair)
-            }
             _ => {
                 return Err(ServerError::Protocol(format!(
                     "Unknown Secp256k1 signing domain: {}",
@@ -339,10 +329,38 @@ impl SignerClient {
 mod tests {
     use super::*;
     use monad_bls::BlsPubKey;
+    use monad_consensus_types::timeout::TimeoutInfo;
+    use monad_consensus_types::voting::Vote as VoteData;
     use monad_crypto::certificate_signature::PubKey;
     use monad_secp::PubKey as SecpPubKey;
+    use monad_types::{BlockId, Epoch, Hash, Round, GENESIS_ROUND};
     use std::thread;
     use tempfile::TempDir;
+
+    // Helper functions for creating RLP-encoded test messages
+
+    /// Create a test Vote and RLP-encode it
+    fn encode_vote(epoch: u64, round: u64, block_id_byte: u8) -> Vec<u8> {
+        let mut hash = [0u8; 32];
+        hash[0] = block_id_byte;
+        let vote = VoteData {
+            id: BlockId(Hash(hash)),
+            round: Round(round),
+            epoch: Epoch(epoch),
+        };
+        alloy_rlp::encode(&vote)
+    }
+
+    /// Create a test TimeoutInfo and RLP-encode it
+    fn encode_timeout_info(epoch: u64, round: u64, high_qc_round: u64) -> Vec<u8> {
+        let timeout_info = TimeoutInfo {
+            epoch: Epoch(epoch),
+            round: Round(round),
+            high_qc_round: Round(high_qc_round),
+            high_tip_round: GENESIS_ROUND,
+        };
+        alloy_rlp::encode(&timeout_info)
+    }
 
     fn create_test_keypairs() -> (BlsKeyPair, SecpKeyPair) {
         let mut bls_secret = [127u8; 32];
@@ -383,8 +401,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (server, _) = create_test_server(&temp_dir);
 
-        let message = b"test vote message";
-        let result = server.sign_bls(Vote::PREFIX, message);
+        let message = encode_vote(1, 1, 0);
+        let result = server.sign_bls(Vote::PREFIX, &message);
 
         assert!(result.is_ok());
         let sig_bytes = result.unwrap();
@@ -392,7 +410,7 @@ mod tests {
         // Verify the signature is valid
         let sig = BlsSignature::deserialize(&sig_bytes).unwrap();
         let (bls_kp, _) = create_test_keypairs();
-        assert!(sig.verify::<Vote>(message, &bls_kp.pubkey()).is_ok());
+        assert!(sig.verify::<Vote>(&message, &bls_kp.pubkey()).is_ok());
     }
 
     #[test]
@@ -400,15 +418,15 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (server, _) = create_test_server(&temp_dir);
 
-        let message = b"test timeout message";
-        let result = server.sign_bls(Timeout::PREFIX, message);
+        let message = encode_timeout_info(1, 1, 0);
+        let result = server.sign_bls(Timeout::PREFIX, &message);
 
         assert!(result.is_ok());
         let sig_bytes = result.unwrap();
 
         let sig = BlsSignature::deserialize(&sig_bytes).unwrap();
         let (bls_kp, _) = create_test_keypairs();
-        assert!(sig.verify::<Timeout>(message, &bls_kp.pubkey()).is_ok());
+        assert!(sig.verify::<Timeout>(&message, &bls_kp.pubkey()).is_ok());
     }
 
     #[test]
@@ -539,20 +557,20 @@ mod tests {
         thread::sleep(std::time::Duration::from_millis(50));
 
         let client = SignerClient::new(&socket_path);
-        let message = b"test vote message for verification";
+        let message = encode_vote(1, 1, 0);
 
         let sig_bytes = client
             .sign(SignRequest {
                 key_type: KeyType::Bls,
                 domain: Vote::PREFIX.to_vec(),
-                message: message.to_vec(),
+                message: message.clone(),
                 request_id: 1,
             })
             .unwrap();
 
         // Verify the signature locally
         let sig = BlsSignature::deserialize(&sig_bytes).unwrap();
-        assert!(sig.verify::<Vote>(message, &bls_kp.pubkey()).is_ok());
+        assert!(sig.verify::<Vote>(&message, &bls_kp.pubkey()).is_ok());
 
         server_handle.join().unwrap();
     }
@@ -581,18 +599,18 @@ mod tests {
         let bls_pk = BlsPubKey::from_bytes(&bls_pk_bytes).unwrap();
         assert_eq!(bls_pk, bls_kp.pubkey());
 
-        // Request 2: Sign BLS message
-        let msg1 = b"vote message 1";
+        // Request 2: Sign BLS message (properly RLP-encoded Vote)
+        let msg1 = encode_vote(1, 1, 0);
         let sig1_bytes = client
             .sign(SignRequest {
                 key_type: KeyType::Bls,
                 domain: Vote::PREFIX.to_vec(),
-                message: msg1.to_vec(),
+                message: msg1.clone(),
                 request_id: 1,
             })
             .unwrap();
         let sig1 = BlsSignature::deserialize(&sig1_bytes).unwrap();
-        assert!(sig1.verify::<Vote>(msg1, &bls_pk).is_ok());
+        assert!(sig1.verify::<Vote>(&msg1, &bls_pk).is_ok());
 
         // Request 3: Sign Secp message
         let msg2 = b"consensus message";
